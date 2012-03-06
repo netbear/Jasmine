@@ -60,7 +60,7 @@ unsigned int ssd_major[SSD_MAJOR];
 
 struct kmem_cache * ss_cmt_cache;
 
-char * ssds[] = { "/dev/sda", };
+const char * ssds[] = { "/dev/sda", "kkk",};
 
 LIST_HEAD(ssd_list);
 
@@ -110,18 +110,33 @@ static int find_and_init_disk(void)
     struct block_device * bdev;
     struct ssd_disk * sdk;
 
-    for (i = 0; i < sizeof(ssds); i++) {
+    for (i = 0; i < sizeof(ssds) / sizeof(ssds[0]); i++) {
         bdev = lookup_bdev(ssds[i]);
-        if (bdev) {
+        if (!IS_ERR_OR_NULL(bdev)) {
             SDEBUG("%s as ssd wi soft-ftl found!\n", ssds[i]);
             found ++;
             sdk = kzalloc(sizeof(struct ssd_disk), GFP_KERNEL);
             list_add(&sdk->list, &ssd_list);
             sdk->bdev = bdev;
+            sdk->name = ssds[i];
+            sdk->gd = alloc_disk(SSD_MINORS);
         }
     }
 
     return found;
+}
+
+static void destroy_disk(void)
+{
+    struct list_head * ptr, *next;
+    struct ssd_disk * sdk;
+
+    list_for_each_safe(ptr, next, &ssd_list) {
+        sdk = list_entry(ptr, typeof(*sdk), list);
+        list_del(ptr);
+        SDEBUG("%s freed\n", sdk->name);
+        kfree(sdk);
+    } 
 }
 
 
@@ -136,7 +151,10 @@ static int __init init_ssd(void)
     if (!major)
         return -ENODEV;
 
-    find_and_init_disk();
+    if (!find_and_init_disk()) {
+        err = -ENODEV;
+        goto err_out;
+    }
 
     ss_cmt_cache = kmem_cache_create("ss_cmt_cache", CMT_SIZE, 0, 0, NULL);
 
@@ -158,6 +176,7 @@ static void __exit exit_ssd(void)
     int i;
 
     kmem_cache_destroy(ss_cmt_cache);
+    destroy_disk();
     for (i = 0; i < SSD_MAJOR; i ++)
         unregister_blkdev(ssd_major[i], "ss");
 }

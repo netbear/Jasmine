@@ -21,7 +21,10 @@
 
 #include <linux/list.h>
 
+#define SSD_DEBUG
+
 #define SSD_MAJOR 4
+#define SSD_MINORS 16
 #define CMT_SIZE  8192
 
 #ifdef SSD_DEBUG
@@ -34,6 +37,7 @@ struct ssd_disk {
     struct list_head list;
     struct gendisk * gd;
     struct block_device * bdev;
+    const char * name;
 };
 
 #endif
