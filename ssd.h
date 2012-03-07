@@ -28,7 +28,7 @@
 #define CMT_SIZE  8192
 
 #ifdef SSD_DEBUG
-    #define SDEBUG(fmt, args...) printk( KERN_DEBUG "ssd: " fmt, ##args)
+    #define SDEBUG(fmt, args...) printk( KERN_DEBUG "ss: " fmt, ##args)
 #else
     #define SDEBUG(fmt, args...)
 #endif
@@ -38,6 +38,7 @@ struct ssd_disk {
     struct gendisk * gd;
     struct block_device * bdev;
     const char * name;
+    make_request_fn * old_request_fn;
 };
 
 #endif

@@ -59,6 +59,7 @@ static struct scsi_driver ss_template = {
 unsigned int ssd_major[SSD_MAJOR];
 
 struct kmem_cache * ss_cmt_cache;
+make_request_fn * mrf = NULL;
 
 const char * ssds[] = { "/dev/sda", "kkk",};
 
@@ -93,6 +94,36 @@ static int ss_revalidate_disk(struct gendisk *disk)
     return 0;
 }
 
+static int format_disk_name(char * prefix, int index, char * buf, int len)
+{
+    const int base = 26;
+    char * begin = buf + strlen(prefix);
+    char * end = buf + len;
+    char * p = end - 1;
+    *p = '\0';
+
+    while (--p >= begin) {
+        *p = 'a' + (index % base);
+        index = (index / base) - 1;
+        if (index < 0)
+            break;
+    }
+
+    if (p < begin)
+        return -EINVAL;
+
+    memmove(begin, p, end - p);
+    memcpy(buf, prefix, strlen(prefix));
+
+    return 0;
+}
+
+static int ss_make_request_fn(struct request_queue * q, struct bio * bio)
+{
+    SDEBUG("Issue Request %llx %x sectors\n", bio->bi_sector, bio_sectors(bio));
+    return mrf(q,bio);
+}
+
 static const struct block_device_operations ss_fops = {
         .owner      = THIS_MODULE,
         .open       = ss_open,
@@ -106,20 +137,45 @@ static const struct block_device_operations ss_fops = {
 
 static int find_and_init_disk(void)
 {
-    int i, found = 0;
+    int i, found = 0, partno;
     struct block_device * bdev;
     struct ssd_disk * sdk;
+    struct gendisk * gd, * oldgd;
 
     for (i = 0; i < sizeof(ssds) / sizeof(ssds[0]); i++) {
         bdev = lookup_bdev(ssds[i]);
         if (!IS_ERR_OR_NULL(bdev)) {
             SDEBUG("%s as ssd wi soft-ftl found!\n", ssds[i]);
-            found ++;
             sdk = kzalloc(sizeof(struct ssd_disk), GFP_KERNEL);
             list_add(&sdk->list, &ssd_list);
             sdk->bdev = bdev;
             sdk->name = ssds[i];
-            sdk->gd = alloc_disk(SSD_MINORS);
+            gd = alloc_disk(SSD_MINORS);
+            if (!gd) {
+                printk(KERN_ERR "ss: cannot alloc gendisk!\n");
+                continue;
+            }
+            format_disk_name("ss", i, gd->disk_name, DISK_NAME_LEN);
+            SDEBUG("disk %s created\n", gd->disk_name);
+
+            oldgd = get_gendisk(bdev->bd_dev, &partno);
+            if (!oldgd)
+                printk(KERN_ERR "ss: cannot get gendisk associated with the block device!\n");
+            else
+                gd->queue = oldgd->queue;
+
+            if (!gd->queue)
+                printk(KERN_ERR "ss: cannot get request queue !\n");
+            else {
+                sdk->old_request_fn = gd->queue->make_request_fn;
+                gd->queue->make_request_fn = ss_make_request_fn;
+                mrf = sdk->old_request_fn;
+            }
+
+            gd->fops = &ss_fops;
+            sdk->gd = gd;
+            //add_disk(gd);
+            found ++;
         }
     }
 
@@ -129,13 +185,18 @@ static int find_and_init_disk(void)
 static void destroy_disk(void)
 {
     struct list_head * ptr, *next;
-    struct ssd_disk * sdk;
+    struct ssd_disk * sdk = NULL;
 
     list_for_each_safe(ptr, next, &ssd_list) {
         sdk = list_entry(ptr, typeof(*sdk), list);
+        SDEBUG("%s freed\n", sdk->gd->disk_name);
+        sdk->gd->queue->make_request_fn = sdk->old_request_fn;
+        //del_gendisk(sdk->gd);
         list_del(ptr);
-        SDEBUG("%s freed\n", sdk->name);
-        kfree(sdk);
+        if (sdk == NULL)
+            printk(KERN_ERR "ss: null ssd_disk!\n");
+        else
+            kfree(sdk);
     } 
 }
 
