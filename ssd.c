@@ -142,7 +142,7 @@ static int find_and_init_disk(void)
     struct ssd_disk * sdk;
     struct gendisk * gd, * oldgd;
 
-    for (i = 0; i < sizeof(ssds) / sizeof(ssds[0]); i++) {
+    for (i = 0; i < sizeof(ssds) / sizeof(ssds[0]) && i < SSD_MAJOR; i++) {
         bdev = lookup_bdev(ssds[i]);
         if (!IS_ERR_OR_NULL(bdev)) {
             SDEBUG("%s as ssd wi soft-ftl found!\n", ssds[i]);
@@ -173,8 +173,14 @@ static int find_and_init_disk(void)
             }
 
             gd->fops = &ss_fops;
+            gd->major = ssd_major[i];
+            gd->first_minor = 0;
+            gd->minors = SSD_MINORS;
+            set_capacity(gd, oldgd->part0.nr_sects);
             sdk->gd = gd;
-            //add_disk(gd);
+
+            add_disk(gd);
+            SDEBUG("disk %s added successfully!\n", gd->disk_name);
             found ++;
         }
     }
@@ -191,7 +197,7 @@ static void destroy_disk(void)
         sdk = list_entry(ptr, typeof(*sdk), list);
         SDEBUG("%s freed\n", sdk->gd->disk_name);
         sdk->gd->queue->make_request_fn = sdk->old_request_fn;
-        //del_gendisk(sdk->gd);
+        del_gendisk(sdk->gd);
         list_del(ptr);
         if (sdk == NULL)
             printk(KERN_ERR "ss: null ssd_disk!\n");
