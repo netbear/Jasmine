@@ -23,11 +23,17 @@
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
+#include <asm/unaligned.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
 #include <scsi/scsi_driver.h>
 #include <scsi/scsi_device.h>
+#include <scsi/scsi_host.h>
+
+//include sd module function, should be removed in the future;
+#include <../drivers/scsi/sd.h>
+#include <../drivers/scsi/scsi_logging.h>
 
 #include "ssd.h"
 
@@ -58,10 +64,12 @@ static struct scsi_driver ss_template = {
 
 unsigned int ssd_major[SSD_MAJOR];
 
-struct kmem_cache * ss_cmt_cache;
+static struct kmem_cache * ss_cdb_cache;
+static mempool_t * ss_cdb_pool;
+
 make_request_fn * mrf = NULL;
 
-const char * ssds[] = { "/dev/sda", "kkk",};
+const char * ssds[] = { "/dev/sda",};
 
 LIST_HEAD(ssd_list);
 
@@ -75,12 +83,6 @@ static int ss_release(struct gendisk * disk, fmode_t mode) {
     //struct scsi_disk *sdkp = scsi_disk(disk);
 
     //scsi_disk_put(sdkp);
-    return 0;
-}
-
-static int ss_ioctl(struct block_device *bdev, fmode_t mode,
-        unsigned int cmd, unsigned long arg)
-{
     return 0;
 }
 
@@ -118,17 +120,413 @@ static int format_disk_name(char * prefix, int index, char * buf, int len)
     return 0;
 }
 
-static int ss_make_request_fn(struct request_queue * q, struct bio * bio)
+static void ss_prot_op(struct scsi_cmnd *scmd, unsigned int dif)
+{
+    unsigned int prot_op = SCSI_PROT_NORMAL;
+    unsigned int dix = scsi_prot_sg_count(scmd);
+
+    if (scmd->sc_data_direction == DMA_FROM_DEVICE) {
+        if (dif && dix)
+            prot_op = SCSI_PROT_READ_PASS;
+        else if (dif && !dix)
+            prot_op = SCSI_PROT_READ_STRIP;
+        else if (!dif && dix)
+            prot_op = SCSI_PROT_READ_INSERT;
+    } else {
+        if (dif && dix)
+            prot_op = SCSI_PROT_WRITE_PASS;
+        else if (dif && !dix)
+            prot_op = SCSI_PROT_WRITE_INSERT;
+        else if (!dif && dix)
+            prot_op = SCSI_PROT_WRITE_STRIP;
+    }
+
+    scsi_set_prot_op(scmd, prot_op);
+    scsi_set_prot_type(scmd, dif);
+}
+
+/**
+ * scsi_setup_discard_cmnd - unmap blocks on thinly provisioned device
+ * @sdp: scsi device to operate one
+ * @rq: Request to prepare
+ *
+ * Will issue either UNMAP or WRITE SAME(16) depending on preference
+ * indicated by target device.
+ **/
+static int scsi_setup_discard_cmnd(struct scsi_device *sdp, struct request *rq)
+{
+    struct ssd_disk *sdkp = ssd_disk(rq->rq_disk);
+    struct bio *bio = rq->bio;
+    sector_t sector = bio->bi_sector;
+    unsigned int nr_sectors = bio_sectors(bio);
+    unsigned int len;
+    int ret;
+    char *buf;
+    struct page *page;
+
+    if (sdkp->device->sector_size == 4096) {
+        sector >>= 3;
+        nr_sectors >>= 3;
+    }
+
+    rq->timeout = SSD_TIMEOUT;
+
+    memset(rq->cmd, 0, rq->cmd_len);
+
+    page = alloc_page(GFP_ATOMIC | __GFP_ZERO);
+    if (!page)
+        return BLKPREP_DEFER;
+
+    switch (sdkp->provisioning_mode) {
+    case SD_LBP_UNMAP:
+        buf = page_address(page);
+
+        rq->cmd_len = 10;
+        rq->cmd[0] = UNMAP;
+        rq->cmd[8] = 24;
+
+        put_unaligned_be16(6 + 16, &buf[0]);
+        put_unaligned_be16(16, &buf[2]);
+        put_unaligned_be64(sector, &buf[8]);
+        put_unaligned_be32(nr_sectors, &buf[16]);
+
+        len = 24;
+        break;
+
+    case SD_LBP_WS16:
+        rq->cmd_len = 16;
+        rq->cmd[0] = WRITE_SAME_16;
+        rq->cmd[1] = 0x8; /* UNMAP */
+        put_unaligned_be64(sector, &rq->cmd[2]);
+        put_unaligned_be32(nr_sectors, &rq->cmd[10]);
+
+        len = sdkp->device->sector_size;
+        break;
+
+    case SD_LBP_WS10:
+    case SD_LBP_ZERO:
+        rq->cmd_len = 10;
+        rq->cmd[0] = WRITE_SAME;
+        if (sdkp->provisioning_mode == SD_LBP_WS10)
+            rq->cmd[1] = 0x8; /* UNMAP */
+        put_unaligned_be32(sector, &rq->cmd[2]);
+        put_unaligned_be16(nr_sectors, &rq->cmd[7]);
+
+        len = sdkp->device->sector_size;
+        break;
+
+    default:
+        ret = BLKPREP_KILL;
+        goto out;
+    }
+
+    blk_add_request_payload(rq, page, len);
+    ret = scsi_setup_blk_pc_cmnd(sdp, rq);
+    rq->buffer = page_address(page);
+
+out:
+    if (ret != BLKPREP_OK) {
+        __free_page(page);
+        rq->buffer = NULL;
+    }
+    return ret;
+}
+
+static int scsi_setup_flush_cmnd(struct scsi_device *sdp, struct request *rq)
+{
+    rq->timeout = SD_FLUSH_TIMEOUT;
+    rq->retries = SD_MAX_RETRIES;
+    rq->cmd[0] = SYNCHRONIZE_CACHE;
+    rq->cmd_len = 10;
+
+    return scsi_setup_blk_pc_cmnd(sdp, rq);
+}
+
+
+static void ss_make_request_fn(struct request_queue * q, struct bio * bio)
 {
     SDEBUG("Issue Request %llx %x sectors\n", bio->bi_sector, bio_sectors(bio));
-    return mrf(q,bio);
+    mrf(q,bio);
+}
+
+/* Build a scsi command and initiate the block address, including the flash device address
+ * translation. Will call the ftl module.
+ *
+ * Returns 1 if successful and 0 if error
+ */
+static int ss_prep_rq_fn(struct request_queue * q, struct request * rq)
+{
+    struct scsi_device * sdp = q->queuedata;
+    struct ssd_disk * sdkp = ssd_disk(rq->rq_disk);
+    struct scsi_cmnd *SCpnt;
+    struct gendisk *disk = rq->rq_disk;
+    sector_t block = blk_rq_pos(rq);
+    sector_t threshold;
+    unsigned int this_count = blk_rq_sectors(rq);
+    int ret, host_dif;
+    unsigned char protect;
+
+    BUG_ON(!sdp->host);
+
+    /*
+     * Discard request come in as REQ_TYPE_FS but we turn them into
+     * block PC requests to make life easier.
+     */
+
+    if (rq->cmd_flags & REQ_DISCARD) {
+        ret = scsi_setup_discard_cmnd(sdp, rq);
+        goto out;
+    } else if (rq->cmd_flags & REQ_FLUSH) {
+        ret = scsi_setup_flush_cmnd(sdp, rq);
+        goto out;
+    } else  if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
+        ret = scsi_setup_blk_pc_cmnd(sdp, rq);
+        goto out;
+    } else if (rq->cmd_type != REQ_TYPE_FS) {
+        ret = BLKPREP_KILL;
+        goto out;
+    }
+    ret = scsi_setup_fs_cmnd(sdp, rq);
+    if (ret != BLKPREP_OK)
+        goto out;
+    SCpnt = rq->special;
+
+    /* from here on until we're complete, any goto out
+     * is used for a killable error condition */
+    ret = BLKPREP_KILL;
+
+    SCSI_LOG_HLQUEUE(1, scmd_printk(KERN_INFO, SCpnt,
+                    "sd_init_command: block=%llu, "
+                    "count=%d\n",
+                    (unsigned long long)block,
+                    this_count));
+
+    if (!sdp || !scsi_device_online(sdp) ||
+        block + blk_rq_sectors(rq) > get_capacity(disk)) {
+        SCSI_LOG_HLQUEUE(2, scmd_printk(KERN_INFO, SCpnt,
+                        "Finishing %u sectors\n",
+                        blk_rq_sectors(rq)));
+        SCSI_LOG_HLQUEUE(2, scmd_printk(KERN_INFO, SCpnt,
+                        "Retry with 0x%p\n", SCpnt));
+        goto out;
+    }
+
+    if (sdp->changed) {
+        /*
+         * quietly refuse to do anything to a changed disc until 
+         * the changed bit has been reset
+         */
+        /* printk("SCSI disk has been changed or is not present. Prohibiting further I/O.\n"); */
+        goto out;
+    }
+
+    /*
+     * Some SD card readers can't handle multi-sector accesses which touch
+     * the last one or two hardware sectors.  Split accesses as needed.
+     */
+    threshold = get_capacity(disk) - SD_LAST_BUGGY_SECTORS *
+        (sdp->sector_size / 512);
+
+    if (unlikely(sdp->last_sector_bug && block + this_count > threshold)) {
+        if (block < threshold) {
+            /* Access up to the threshold but not beyond */
+            this_count = threshold - block;
+        } else {
+            /* Access only a single hardware sector */
+            this_count = sdp->sector_size / 512;
+        }
+    }
+
+    SCSI_LOG_HLQUEUE(2, scmd_printk(KERN_INFO, SCpnt, "block=%llu\n",
+                    (unsigned long long)block));
+
+    /*
+     * If we have a 1K hardware sectorsize, prevent access to single
+     * 512 byte sectors.  In theory we could handle this - in fact
+     * the scsi cdrom driver must be able to handle this because
+     * we typically use 1K blocksizes, and cdroms typically have
+     * 2K hardware sectorsizes.  Of course, things are simpler
+     * with the cdrom, since it is read-only.  For performance
+     * reasons, the filesystems should be able to handle this
+     * and not force the scsi disk driver to use bounce buffers
+     * for this.
+     */
+    if (sdp->sector_size == 1024) {
+        if ((block & 1) || (blk_rq_sectors(rq) & 1)) {
+            scmd_printk(KERN_ERR, SCpnt,
+                    "Bad block number requested\n");
+            goto out;
+        } else {
+            block = block >> 1;
+            this_count = this_count >> 1;
+        }
+    }
+    if (sdp->sector_size == 2048) {
+        if ((block & 3) || (blk_rq_sectors(rq) & 3)) {
+            scmd_printk(KERN_ERR, SCpnt,
+                    "Bad block number requested\n");
+            goto out;
+        } else {
+            block = block >> 2;
+            this_count = this_count >> 2;
+        }
+    }
+    if (sdp->sector_size == 4096) {
+        if ((block & 7) || (blk_rq_sectors(rq) & 7)) {
+            scmd_printk(KERN_ERR, SCpnt,
+                    "Bad block number requested\n");
+            goto out;
+        } else {
+            block = block >> 3;
+            this_count = this_count >> 3;
+        }
+    }
+    if (rq_data_dir(rq) == WRITE) {
+        if (!sdp->writeable) {
+            goto out;
+        }
+        SCpnt->cmnd[0] = WRITE_6;
+        SCpnt->sc_data_direction = DMA_TO_DEVICE;
+
+        if (blk_integrity_rq(rq))
+            goto out;
+
+    } else if (rq_data_dir(rq) == READ) {
+        SCpnt->cmnd[0] = READ_6;
+        SCpnt->sc_data_direction = DMA_FROM_DEVICE;
+    } else {
+        scmd_printk(KERN_ERR, SCpnt, "Unknown command %x\n", rq->cmd_flags);
+        goto out;
+    }
+
+    SCSI_LOG_HLQUEUE(2, scmd_printk(KERN_INFO, SCpnt,
+                    "%s %d/%u 512 byte blocks.\n",
+                    (rq_data_dir(rq) == WRITE) ?
+                    "writing" : "reading", this_count,
+                    blk_rq_sectors(rq)));
+
+    /* Set RDPROTECT/WRPROTECT if disk is formatted with DIF */
+    host_dif = scsi_host_dif_capable(sdp->host, sdkp->protection_type);
+    if (host_dif)
+        protect = 1 << 5;
+    else
+        protect = 0;
+
+    if (host_dif == SD_DIF_TYPE2_PROTECTION) {
+        SCpnt->cmnd = mempool_alloc(ss_cdb_pool, GFP_ATOMIC);
+
+        if (unlikely(SCpnt->cmnd == NULL)) {
+            ret = BLKPREP_DEFER;
+            goto out;
+        }
+
+        SCpnt->cmd_len = SD_EXT_CDB_SIZE;
+        memset(SCpnt->cmnd, 0, SCpnt->cmd_len);
+        SCpnt->cmnd[0] = VARIABLE_LENGTH_CMD;
+        SCpnt->cmnd[7] = 0x18;
+        SCpnt->cmnd[9] = (rq_data_dir(rq) == READ) ? READ_32 : WRITE_32;
+        SCpnt->cmnd[10] = protect | ((rq->cmd_flags & REQ_FUA) ? 0x8 : 0);
+
+        /* LBA */
+        SCpnt->cmnd[12] = sizeof(block) > 4 ? (unsigned char) (block >> 56) & 0xff : 0;
+        SCpnt->cmnd[13] = sizeof(block) > 4 ? (unsigned char) (block >> 48) & 0xff : 0;
+        SCpnt->cmnd[14] = sizeof(block) > 4 ? (unsigned char) (block >> 40) & 0xff : 0;
+        SCpnt->cmnd[15] = sizeof(block) > 4 ? (unsigned char) (block >> 32) & 0xff : 0;
+        SCpnt->cmnd[16] = (unsigned char) (block >> 24) & 0xff;
+        SCpnt->cmnd[17] = (unsigned char) (block >> 16) & 0xff;
+        SCpnt->cmnd[18] = (unsigned char) (block >> 8) & 0xff;
+        SCpnt->cmnd[19] = (unsigned char) block & 0xff;
+
+        /* Expected Indirect LBA */
+        SCpnt->cmnd[20] = (unsigned char) (block >> 24) & 0xff;
+        SCpnt->cmnd[21] = (unsigned char) (block >> 16) & 0xff;
+        SCpnt->cmnd[22] = (unsigned char) (block >> 8) & 0xff;
+        SCpnt->cmnd[23] = (unsigned char) block & 0xff;
+
+        /* Transfer length */
+        SCpnt->cmnd[28] = (unsigned char) (this_count >> 24) & 0xff;
+        SCpnt->cmnd[29] = (unsigned char) (this_count >> 16) & 0xff;
+        SCpnt->cmnd[30] = (unsigned char) (this_count >> 8) & 0xff;
+        SCpnt->cmnd[31] = (unsigned char) this_count & 0xff;
+    } else if (block > 0xffffffff) {
+        SCpnt->cmnd[0] += READ_16 - READ_6;
+        SCpnt->cmnd[1] = protect | ((rq->cmd_flags & REQ_FUA) ? 0x8 : 0);
+        SCpnt->cmnd[2] = sizeof(block) > 4 ? (unsigned char) (block >> 56) & 0xff : 0;
+        SCpnt->cmnd[3] = sizeof(block) > 4 ? (unsigned char) (block >> 48) & 0xff : 0;
+        SCpnt->cmnd[4] = sizeof(block) > 4 ? (unsigned char) (block >> 40) & 0xff : 0;
+        SCpnt->cmnd[5] = sizeof(block) > 4 ? (unsigned char) (block >> 32) & 0xff : 0;
+        SCpnt->cmnd[6] = (unsigned char) (block >> 24) & 0xff;
+        SCpnt->cmnd[7] = (unsigned char) (block >> 16) & 0xff;
+        SCpnt->cmnd[8] = (unsigned char) (block >> 8) & 0xff;
+        SCpnt->cmnd[9] = (unsigned char) block & 0xff;
+        SCpnt->cmnd[10] = (unsigned char) (this_count >> 24) & 0xff;
+        SCpnt->cmnd[11] = (unsigned char) (this_count >> 16) & 0xff;
+        SCpnt->cmnd[12] = (unsigned char) (this_count >> 8) & 0xff;
+        SCpnt->cmnd[13] = (unsigned char) this_count & 0xff;
+        SCpnt->cmnd[14] = SCpnt->cmnd[15] = 0;
+    } else if ((this_count > 0xff) || (block > 0x1fffff) ||
+           scsi_device_protection(SCpnt->device) ||
+           SCpnt->device->use_10_for_rw) {
+        if (this_count > 0xffff)
+            this_count = 0xffff;
+
+        SCpnt->cmnd[0] += READ_10 - READ_6;
+        SCpnt->cmnd[1] = protect | ((rq->cmd_flags & REQ_FUA) ? 0x8 : 0);
+        SCpnt->cmnd[2] = (unsigned char) (block >> 24) & 0xff;
+        SCpnt->cmnd[3] = (unsigned char) (block >> 16) & 0xff;
+        SCpnt->cmnd[4] = (unsigned char) (block >> 8) & 0xff;
+        SCpnt->cmnd[5] = (unsigned char) block & 0xff;
+        SCpnt->cmnd[6] = SCpnt->cmnd[9] = 0;
+        SCpnt->cmnd[7] = (unsigned char) (this_count >> 8) & 0xff;
+        SCpnt->cmnd[8] = (unsigned char) this_count & 0xff;
+    } else {
+        if (unlikely(rq->cmd_flags & REQ_FUA)) {
+            /*
+             * This happens only if this drive failed
+             * 10byte rw command with ILLEGAL_REQUEST
+             * during operation and thus turned off
+             * use_10_for_rw.
+             */
+            scmd_printk(KERN_ERR, SCpnt,
+                    "FUA write on READ/WRITE(6) drive\n");
+            goto out;
+        }
+
+        SCpnt->cmnd[1] |= (unsigned char) ((block >> 16) & 0x1f);
+        SCpnt->cmnd[2] = (unsigned char) ((block >> 8) & 0xff);
+        SCpnt->cmnd[3] = (unsigned char) block & 0xff;
+        SCpnt->cmnd[4] = (unsigned char) this_count;
+        SCpnt->cmnd[5] = 0;
+    }
+    SCpnt->sdb.length = this_count * sdp->sector_size;
+
+    /* If DIF or DIX is enabled, tell HBA how to handle request */
+    if (host_dif || scsi_prot_sg_count(SCpnt))
+        ss_prot_op(SCpnt, host_dif);
+
+    /*
+     * We shouldn't disconnect in the middle of a sector, so with a dumb
+     * host adapter, it's safe to assume that we can at least transfer
+     * this many bytes between each connect / disconnect.
+     */
+    SCpnt->transfersize = sdp->sector_size;
+    SCpnt->underflow = this_count << 9;
+    SCpnt->allowed = SD_MAX_RETRIES;
+
+    /*
+     * This indicates that the command is ready from our end to be
+     * queued.
+     */
+    ret = BLKPREP_OK;
+ out:
+    return scsi_prep_return(q, rq, ret);
 }
 
 static const struct block_device_operations ss_fops = {
         .owner      = THIS_MODULE,
         .open       = ss_open,
         .release    = ss_release,
-        .locked_ioctl =  ss_ioctl,
+        //.locked_ioctl =  ss_ioctl,
         .getgeo     = NULL,
         .media_changed = ss_media_changed,
         .revalidate_disk = ss_revalidate_disk,
@@ -141,6 +539,8 @@ static int find_and_init_disk(void)
     struct block_device * bdev;
     struct ssd_disk * sdk;
     struct gendisk * gd, * oldgd;
+    struct scsi_device * sdp;
+    struct scsi_disk * sdkp;
 
     for (i = 0; i < sizeof(ssds) / sizeof(ssds[0]) && i < SSD_MAJOR; i++) {
         bdev = lookup_bdev(ssds[i]);
@@ -161,21 +561,35 @@ static int find_and_init_disk(void)
             oldgd = get_gendisk(bdev->bd_dev, &partno);
             if (!oldgd)
                 printk(KERN_ERR "ss: cannot get gendisk associated with the block device!\n");
-            else
+            else {
                 gd->queue = oldgd->queue;
+                sdkp = scsi_disk(oldgd);
+                sdk->protection_type = sdkp->protection_type;
+                sdk->provisioning_mode = sdkp->provisioning_mode;
+                sdk->device = sdkp->device;
+            }
 
             if (!gd->queue)
                 printk(KERN_ERR "ss: cannot get request queue !\n");
             else {
                 sdk->old_request_fn = gd->queue->make_request_fn;
+                sdk->old_prep_fn = gd->queue->prep_rq_fn;
                 gd->queue->make_request_fn = ss_make_request_fn;
                 mrf = sdk->old_request_fn;
+                //just for test
+                gd->queue->prep_rq_fn = ss_prep_rq_fn;
+                sdp = gd->queue->queuedata;
+                if (!sdp->host) {
+                    printk(KERN_ERR "ss: host in queue is null!\n");
+                    break;
+                }
             }
 
             gd->fops = &ss_fops;
             gd->major = ssd_major[i];
             gd->first_minor = 0;
             gd->minors = SSD_MINORS;
+            gd->private_data = &sdk->list;
             set_capacity(gd, oldgd->part0.nr_sects);
             sdk->gd = gd;
 
@@ -197,6 +611,7 @@ static void destroy_disk(void)
         sdk = list_entry(ptr, typeof(*sdk), list);
         SDEBUG("%s freed\n", sdk->gd->disk_name);
         sdk->gd->queue->make_request_fn = sdk->old_request_fn;
+        sdk->gd->queue->prep_rq_fn = sdk->old_prep_fn;
         del_gendisk(sdk->gd);
         list_del(ptr);
         if (sdk == NULL)
@@ -223,15 +638,23 @@ static int __init init_ssd(void)
         goto err_out;
     }
 
-    ss_cmt_cache = kmem_cache_create("ss_cmt_cache", CMT_SIZE, 0, 0, NULL);
+    ss_cdb_cache = kmem_cache_create("ss_cdb_cache", CDB_SIZE, 0, 0, NULL);
 
-    if (!ss_cmt_cache) {
-        printk(KERN_ERR "ss: can't init cmt cache\n");
+    if (!ss_cdb_cache) {
+        printk(KERN_ERR "ss: can't init cdb cache\n");
         goto err_out;
     }
 
-    return 0;
+    ss_cdb_pool = mempool_create_slab_pool(MEMPOOL_SIZE, ss_cdb_cache);
 
+    if (!ss_cdb_pool) {
+        printk(KERN_ERR "ss: can't init cdb pool\n");
+        goto err_cache;
+    }
+
+    return 0;
+err_cache:
+    kmem_cache_destroy(ss_cdb_cache);
 err_out:
     for (i = 0; i < SSD_MAJOR; i++)
         unregister_blkdev(ssd_major[i], "ss");
@@ -242,7 +665,8 @@ static void __exit exit_ssd(void)
 {
     int i;
 
-    kmem_cache_destroy(ss_cmt_cache);
+    mempool_destroy(ss_cdb_pool);
+    kmem_cache_destroy(ss_cdb_cache);
     destroy_disk();
     for (i = 0; i < SSD_MAJOR; i ++)
         unregister_blkdev(ssd_major[i], "ss");
