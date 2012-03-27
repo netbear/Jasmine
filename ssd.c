@@ -811,6 +811,7 @@ static void destroy_disk(void)
         sdk->gd->queue->make_request_fn = sdk->old_request_fn;
         sdk->gd->queue->prep_rq_fn = sdk->old_prep_fn;
         bioset_free(sdk->bs);
+        mempool_destroy(sdk->io_pool);
         del_gendisk(sdk->gd);
         list_del(ptr);
         if (sdk == NULL)
@@ -854,10 +855,12 @@ static int __init init_ssd(void)
 
     if (!find_and_init_disk()) {
         err = -ENODEV;
-        goto err_io;
+        goto err_pool;
     }
 
     return 0;
+err_pool:
+    mempool_destroy(ss_cdb_pool);
 err_io:
     kmem_cache_destroy(ss_io_cache);
 err_cache:
@@ -875,6 +878,7 @@ static void __exit exit_ssd(void)
     mempool_destroy(ss_cdb_pool);
     kmem_cache_destroy(ss_cdb_cache);
     destroy_disk();
+    kmem_cache_destroy(ss_io_cache);
     for (i = 0; i < SSD_MAJOR; i ++)
         unregister_blkdev(ssd_major[i], "ss");
 }
