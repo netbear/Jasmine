@@ -20,6 +20,7 @@
 #define _SSD_H_
 
 #include <linux/list.h>
+#include "ftl.h"
 
 #define SSD_DEBUG
 
@@ -27,9 +28,11 @@
 #define SSD_MINORS 16
 
 #define SSD_TIMEOUT (30 * HZ)
+#define SECTOR_SHIFT 9
 
 enum {
     CDB_SIZE=32, /* scsi cmd size */
+    SSD_BIOS=256, /* ssd bio pool size */
     MEMPOOL_SIZE=4, /* pool size */
 };
 
@@ -58,10 +61,24 @@ struct ssd_disk {
     prep_rq_fn * old_prep_fn;
     u8 protection_type;
     u8 provisioning_mode;
+    struct mapping_region  m_region;
+
+    struct bio_set * bs;
+    mempool_t * io_pool;
 };
 
 static inline struct ssd_disk * ssd_disk(struct gendisk * disk) {
     return container_of(disk->private_data, struct ssd_disk, list);
+}
+
+static inline sector_t to_sector(unsigned long n)
+{
+    return (n >> SECTOR_SHIFT);
+}
+
+static inline unsigned long to_bytes(sector_t n)
+{
+    return (n << SECTOR_SHIFT);
 }
 
 #endif

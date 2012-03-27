@@ -65,6 +65,7 @@ static struct scsi_driver ss_template = {
 unsigned int ssd_major[SSD_MAJOR];
 
 static struct kmem_cache * ss_cdb_cache;
+static struct kmem_cache * ss_io_cache;
 static mempool_t * ss_cdb_pool;
 
 make_request_fn * mrf = NULL;
@@ -96,6 +97,8 @@ static int ss_revalidate_disk(struct gendisk *disk)
     return 0;
 }
 
+
+
 static int format_disk_name(char * prefix, int index, char * buf, int len)
 {
     const int base = 26;
@@ -117,6 +120,169 @@ static int format_disk_name(char * prefix, int index, char * buf, int len)
     memmove(begin, p, end - p);
     memcpy(buf, prefix, strlen(prefix));
 
+    return 0;
+}
+
+struct ss_io {
+    int error;
+    atomic_t io_count;
+    unsigned int start_time;
+    struct bio * bio;
+    struct ssd_disk * sd;
+    spinlock_t endio_lock;
+};
+
+struct clone_info {
+    struct bio * bio;
+    struct ss_io * io;
+    sector_t sector;
+    sector_t sector_count;
+    unsigned int idx;
+};
+
+static struct ss_io * alloc_io(struct ssd_disk * sdk)
+{
+    return mempool_alloc(sdk->io_pool, GFP_NOIO);
+}
+
+static void free_io(struct ssd_disk * sdk, struct ss_io * io)
+{
+    mempool_free(io, sdk->io_pool);
+}
+
+static void ss_bio_destructor(struct bio * bio)
+{
+    struct bio_set * bs = bio->bi_private;
+
+    bio_free(bio, bs);
+}
+
+static void dec_pending(struct ss_io * io, int error)
+{
+    unsigned long flags;
+    struct bio * bio;
+    int io_error;
+    /*
+     * we are supposed to push back any error bio here
+     * should be added in the future
+     */
+    if (unlikely(error)) {
+        spin_lock_irqsave(&io->endio_lock, flags);
+        io->error = error;
+        spin_unlock_irqrestore(&io->endio_lock, flags);
+    }
+
+    if (atomic_dec_and_test(&io->io_count)) {
+        bio = io->bio;
+        io_error = io->error;
+        free_io(io->sd, io);
+        bio_endio(bio, io_error);
+    }
+}
+
+static void clone_endio(struct bio * bio, int error)
+{
+    struct ss_io * sio = bio->bi_private;
+    struct ssd_disk * sd = sio->sd;
+
+    bio->bi_private = sd->bs;
+    bio_put(bio);
+    dec_pending(sio, error);
+}
+
+/*
+ * clone a bio from existing bio, starting from @sector with @len sects
+ * bio_vec used starts from @idx in the bio_vec. @idx will be updated to
+ * be set to the uncloned entry with @offset also updated. 
+ */
+static struct bio * clone_bio(struct bio * bio, sector_t sector, unsigned int * idx, sector_t * offset, sector_t len, struct bio_set * bs)
+{
+    struct bio * clone = NULL;
+    struct bio_vec * bv = bio->bi_io_vec + *idx, * nbv;
+    sector_t remaining = len;
+    clone = bio_alloc_bioset(GFP_NOIO, bio->bi_max_vecs, bs);
+
+    if (!clone)
+        return NULL;
+
+    nbv = clone->bi_io_vec;
+
+    for (; bv < bio->bi_io_vec + bio->bi_vcnt; bv ++) {
+        if (to_sector(bv->bv_len) - *offset > remaining)
+            break;
+        nbv->bv_page = bv->bv_page;
+        nbv->bv_offset = bv->bv_offset + to_bytes(*offset);
+        nbv->bv_len = bv->bv_len - to_bytes(*offset);
+        nbv ++;
+        remaining -= (to_sector(bv->bv_len) - *offset);
+        *offset = 0;
+    }
+
+    if (remaining) {
+        /*
+         *  if there is any io_vec left , 
+         *  we should not reach the end of the io vector list
+         */
+        BUG_ON(bv == bio->bi_io_vec + bio->bi_vcnt);
+
+        nbv->bv_page = bv->bv_page;
+        nbv->bv_offset = bv->bv_offset + to_bytes(*offset);
+        nbv->bv_len = to_bytes(remaining);
+        nbv ++;
+        *offset += remaining;
+    } else
+        *offset = 0;
+
+    clone->bi_vcnt = nbv - clone->bi_io_vec;
+    clone->bi_sector = sector;
+    clone->bi_size = to_bytes(len);
+    clone->bi_destructor = ss_bio_destructor;
+    clone->bi_bdev = bio->bi_bdev;
+    clone->bi_rw = bio->bi_rw;
+    clone->bi_idx = 0;
+    // we have no idea what flags we should use, should check in the future
+    clone->bi_flags = bio->bi_flags | (1 << BIO_CLONED);
+
+    *idx = bv - bio->bi_io_vec;
+
+    return clone;
+}
+
+static void map_bio(struct bio * clone, struct ss_io * sio)
+{
+    clone->bi_end_io = clone_endio;
+    clone->bi_private = sio;
+
+    atomic_inc(&sio->io_count);
+    generic_make_request(clone);
+}
+
+static int __clone_and_map(struct clone_info * ci)
+{
+    struct bio * clone, *bio = ci->bio;
+    struct bio_set * bs =  ci->io->sd->bs;
+
+    sector_t ns, len, offset;
+    ns = (ci->sector + PAGE_SECTOR) & PAGE_SECTOR_MASK;
+    if (ns - ci->sector > ci->sector_count)
+        len = ci->sector_count;
+    else
+        len = ns - ci->sector;
+
+    offset = 0;
+    while (ci->sector_count) {
+        SDEBUG("Clone Request %llx with %llx sectors\n", ci->sector, len);
+        ci->sector_count -= len;
+
+        clone = clone_bio(bio, ci->sector, &ci->idx, &offset, len, bs);
+        map_bio(clone, ci->io);
+
+        if (ci->sector_count < PAGE_SECTOR)
+            len = ci->sector_count;
+        else
+            len = PAGE_SECTOR;
+        ci->sector += len;
+    }
     return 0;
 }
 
@@ -245,8 +411,34 @@ static int scsi_setup_flush_cmnd(struct scsi_device *sdp, struct request *rq)
 
 static void ss_make_request_fn(struct request_queue * q, struct bio * bio)
 {
-    SDEBUG("Issue Request %llx %x sectors\n", bio->bi_sector, bio_sectors(bio));
-    mrf(q,bio);
+    struct gendisk * gdisk;
+    struct ssd_disk * sdk;
+    struct clone_info ci;
+    int error;
+    BUG_ON(bio == NULL);
+
+    if (bio->bi_bdev && !(bio->bi_flags & (1 << BIO_CLONED))) {
+        SDEBUG("Issue Rquest %llx %x sectors\n", bio->bi_sector, bio_sectors(bio));
+        gdisk = bio->bi_bdev->bd_disk;
+        sdk = ssd_disk(gdisk);
+        ci.bio = bio;
+        ci.io = alloc_io(sdk);
+        ci.io->sd = sdk;
+        ci.io->bio = bio;
+        ci.io->error = 0;
+        atomic_set(&ci.io->io_count, 1);
+        spin_lock_init(&ci.io->endio_lock);
+        ci.sector = bio->bi_sector;
+        ci.idx = bio->bi_idx;
+        ci.sector_count = bio_sectors(bio);
+        error = __clone_and_map(&ci);
+
+        // bio split done, drop the extra ref count
+        dec_pending(ci.io, error);
+    } else {
+        SDEBUG("Issue Clone Rquest %llx %x sectors\n", bio->bi_sector, bio_sectors(bio));
+        blk_queue_bio(q,bio);
+    }
 }
 
 /* Build a scsi command and initiate the block address, including the flash device address
@@ -575,8 +767,11 @@ static int find_and_init_disk(void)
                 sdk->old_request_fn = gd->queue->make_request_fn;
                 sdk->old_prep_fn = gd->queue->prep_rq_fn;
                 gd->queue->make_request_fn = ss_make_request_fn;
+
                 mrf = sdk->old_request_fn;
-                //just for test
+                if (mrf != blk_queue_bio)
+                    SDEBUG("make_request_fn is not blk_queue_bio!\n");
+
                 gd->queue->prep_rq_fn = ss_prep_rq_fn;
                 sdp = gd->queue->queuedata;
                 if (!sdp->host) {
@@ -584,6 +779,9 @@ static int find_and_init_disk(void)
                     break;
                 }
             }
+
+            sdk->bs = bioset_create(MEMPOOL_SIZE, 0);
+            sdk->io_pool = mempool_create_slab_pool(MEMPOOL_SIZE, ss_io_cache);
 
             gd->fops = &ss_fops;
             gd->major = ssd_major[i];
@@ -612,6 +810,7 @@ static void destroy_disk(void)
         SDEBUG("%s freed\n", sdk->gd->disk_name);
         sdk->gd->queue->make_request_fn = sdk->old_request_fn;
         sdk->gd->queue->prep_rq_fn = sdk->old_prep_fn;
+        bioset_free(sdk->bs);
         del_gendisk(sdk->gd);
         list_del(ptr);
         if (sdk == NULL)
@@ -633,26 +832,34 @@ static int __init init_ssd(void)
     if (!major)
         return -ENODEV;
 
-    if (!find_and_init_disk()) {
-        err = -ENODEV;
-        goto err_out;
-    }
-
     ss_cdb_cache = kmem_cache_create("ss_cdb_cache", CDB_SIZE, 0, 0, NULL);
+    ss_io_cache = kmem_cache_create("ss_io_cache", sizeof(struct ss_io), 0, 0, NULL);
 
     if (!ss_cdb_cache) {
         printk(KERN_ERR "ss: can't init cdb cache\n");
         goto err_out;
     }
 
+    if (!ss_io_cache) {
+        printk(KERN_ERR "ss: can't init io cache\n");
+        goto err_cache;
+    }
+
     ss_cdb_pool = mempool_create_slab_pool(MEMPOOL_SIZE, ss_cdb_cache);
 
     if (!ss_cdb_pool) {
         printk(KERN_ERR "ss: can't init cdb pool\n");
-        goto err_cache;
+        goto err_io;
+    }
+
+    if (!find_and_init_disk()) {
+        err = -ENODEV;
+        goto err_io;
     }
 
     return 0;
+err_io:
+    kmem_cache_destroy(ss_io_cache);
 err_cache:
     kmem_cache_destroy(ss_cdb_cache);
 err_out:
