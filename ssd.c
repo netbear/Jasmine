@@ -35,6 +35,7 @@
 #include <../drivers/scsi/sd.h>
 #include <../drivers/scsi/scsi_logging.h>
 
+#include "ftl.h"
 #include "ssd.h"
 
 MODULE_AUTHOR("Xiaolin Guo");
@@ -70,7 +71,7 @@ static mempool_t * ss_cdb_pool;
 
 make_request_fn * mrf = NULL;
 
-const char * ssds[] = { "/dev/sda",};
+const char * ssds[] = { "/dev/sdb",};
 
 LIST_HEAD(ssd_list);
 
@@ -154,6 +155,7 @@ static void ss_bio_destructor(struct bio * bio)
 {
     struct bio_set * bs = bio->bi_private;
 
+    SDEBUG("ss bio destructor: execute %llx\n", bio->bi_sector);
     bio_free(bio, bs);
 }
 
@@ -436,7 +438,8 @@ static void ss_make_request_fn(struct request_queue * q, struct bio * bio)
         // bio split done, drop the extra ref count
         dec_pending(ci.io, error);
     } else {
-        SDEBUG("Issue Clone Rquest %llx %x sectors\n", bio->bi_sector, bio_sectors(bio));
+        if (!bio->bi_bdev)
+            SDEBUG("Issue Rquest %llx %x sectors, no block dev\n", bio->bi_sector, bio_sectors(bio));
         blk_queue_bio(q,bio);
     }
 }
@@ -790,9 +793,12 @@ static int find_and_init_disk(void)
             gd->private_data = &sdk->list;
             set_capacity(gd, oldgd->part0.nr_sects);
             sdk->gd = gd;
+            sdk->capacity = oldgd->part0.nr_sects;
 
             add_disk(gd);
             SDEBUG("disk %s added successfully!\n", gd->disk_name);
+            init_mapping_dir(gd);
+
             found ++;
         }
     }
@@ -808,6 +814,7 @@ static void destroy_disk(void)
     list_for_each_safe(ptr, next, &ssd_list) {
         sdk = list_entry(ptr, typeof(*sdk), list);
         SDEBUG("%s freed\n", sdk->gd->disk_name);
+        exit_mapping_dir(sdk->gd);
         sdk->gd->queue->make_request_fn = sdk->old_request_fn;
         sdk->gd->queue->prep_rq_fn = sdk->old_prep_fn;
         bioset_free(sdk->bs);

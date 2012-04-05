@@ -20,7 +20,6 @@
 #define _SSD_H_
 
 #include <linux/list.h>
-#include "ftl.h"
 
 #define SSD_DEBUG
 
@@ -46,7 +45,7 @@ enum {
 };
 
 #ifdef SSD_DEBUG
-    #define SDEBUG(fmt, args...) printk( KERN_DEBUG "ss: " fmt, ##args)
+    #define SDEBUG(fmt, args...) printk( KERN_INFO "ss: " fmt, ##args)
 #else
     #define SDEBUG(fmt, args...)
 #endif
@@ -61,7 +60,9 @@ struct ssd_disk {
     prep_rq_fn * old_prep_fn;
     u8 protection_type;
     u8 provisioning_mode;
-    struct mapping_region  m_region;
+    sector_t capacity;
+    struct global_mapping_dir gmt;
+    int bdev_err;
 
     struct bio_set * bs;
     mempool_t * io_pool;

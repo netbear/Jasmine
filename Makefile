@@ -15,9 +15,9 @@ EXTRA_CFLAGS += -I$(LDDINC)
 ifneq ($(KERNELRELEASE),)
 # call from kernel build system
 
-ftl-objs := ssd.o
+sftl-objs := ssd.o ftl.o
 
-obj-m	:= ftl.o
+obj-m	:= sftl.o
 
 else
 
