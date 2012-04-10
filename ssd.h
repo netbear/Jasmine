@@ -52,16 +52,20 @@ enum {
 
 struct ssd_disk {
     struct list_head list;
+    struct list_head mflush_list;
     struct gendisk * gd;
     struct scsi_device * device;
     struct block_device * bdev;
     const char * name;
-    make_request_fn * old_request_fn;
+    make_request_fn * old_make_request_fn;
     prep_rq_fn * old_prep_fn;
+    request_fn_proc * old_request_fn;
     u8 protection_type;
     u8 provisioning_mode;
     sector_t capacity;
+    struct hw_meta_root root;
     struct global_mapping_dir gmt;
+    struct cached_mapping_table cmt;
     int bdev_err;
 
     struct bio_set * bs;

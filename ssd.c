@@ -418,9 +418,13 @@ static void ss_make_request_fn(struct request_queue * q, struct bio * bio)
     struct clone_info ci;
     int error;
     BUG_ON(bio == NULL);
+    /*if (bio->bi_flags & (1<<BIO_QUIET)) {
+        bio_endio(bio, -EIO);
+        return;
+    }*/
 
     if (bio->bi_bdev && !(bio->bi_flags & (1 << BIO_CLONED))) {
-        SDEBUG("Issue Rquest %llx %x sectors\n", bio->bi_sector, bio_sectors(bio));
+        SDEBUG("Issue Rquest %llx %x sectors flg %lx\n", bio->bi_sector, bio_sectors(bio), bio->bi_flags);
         gdisk = bio->bi_bdev->bd_disk;
         sdk = ssd_disk(gdisk);
         ci.bio = bio;
@@ -742,6 +746,7 @@ static int find_and_init_disk(void)
         if (!IS_ERR_OR_NULL(bdev)) {
             SDEBUG("%s as ssd wi soft-ftl found!\n", ssds[i]);
             sdk = kzalloc(sizeof(struct ssd_disk), GFP_KERNEL);
+            INIT_LIST_HEAD(&sdk->mflush_list);
             list_add(&sdk->list, &ssd_list);
             sdk->bdev = bdev;
             sdk->name = ssds[i];
@@ -767,11 +772,12 @@ static int find_and_init_disk(void)
             if (!gd->queue)
                 printk(KERN_ERR "ss: cannot get request queue !\n");
             else {
-                sdk->old_request_fn = gd->queue->make_request_fn;
+                sdk->old_make_request_fn = gd->queue->make_request_fn;
                 sdk->old_prep_fn = gd->queue->prep_rq_fn;
+                sdk->old_request_fn = gd->queue->request_fn;
                 gd->queue->make_request_fn = ss_make_request_fn;
 
-                mrf = sdk->old_request_fn;
+                mrf = sdk->old_make_request_fn;
                 if (mrf != blk_queue_bio)
                     SDEBUG("make_request_fn is not blk_queue_bio!\n");
 
@@ -815,7 +821,7 @@ static void destroy_disk(void)
         sdk = list_entry(ptr, typeof(*sdk), list);
         SDEBUG("%s freed\n", sdk->gd->disk_name);
         exit_mapping_dir(sdk->gd);
-        sdk->gd->queue->make_request_fn = sdk->old_request_fn;
+        sdk->gd->queue->make_request_fn = sdk->old_make_request_fn;
         sdk->gd->queue->prep_rq_fn = sdk->old_prep_fn;
         bioset_free(sdk->bs);
         mempool_destroy(sdk->io_pool);
